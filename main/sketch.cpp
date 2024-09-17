@@ -13,6 +13,8 @@
 #include "esp_log.h"
 #include "driver/ledc.h"
 
+#define DEBUG_OUTPUT 1
+
 #define POWER_ON_PIN 26
 #define GPIO_FAULT_1 36
 #define GPIO_FAULT_2 34
@@ -20,11 +22,17 @@
 
 #define LED_PIN 2
 #define RMT_TX_CHANNEL RMT_CHANNEL_0
-#define T0H 14
+// Angepasste RMT-Timings für WS2812 (in RMT-Ticks bei clk_div = 2, 40MHz)
+#define T0H 16
+#define T0L 34
+#define T1H 34
+#define T1L 16
+#define BITS_PER_LED_CMD 24
+/*#define T0H 14
 #define T0L 52
 #define T1H 52
 #define T1L 14
-#define BITS_PER_LED_CMD 24
+#define BITS_PER_LED_CMD 24*/
 
 #define BATTERY_PIN ADC1_CHANNEL_7
 #define DEFAULT_VREF 1100
@@ -88,10 +96,14 @@ Servo servos[3] = {
     {17, 10, 90}  // Servo 3
 };
 
-int JoyLx = -1;
-int JoyLy = -1;
-int JoyRx = -1;
-int JoyRy = -1;
+#define MAX_JOYSTICK_VALUE 255 // Maximale Achsenwert
+#define MAX_PWM_VALUE 255      // Maximale PWM-Wert
+
+int JoyLxNeutral = -1;   // From your readings
+int JoyLyNeutral = -1;
+int JoyRxNeutral = -1;
+int JoyRyNeutral = -1;
+
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
 
@@ -160,6 +172,7 @@ void initGPIOFaultCheck() {
 void checkMotorDriverFault() {
     int fault1 = digitalRead(GPIO_FAULT_1);
     int fault2 = digitalRead(GPIO_FAULT_2);
+    #ifdef DEBUG_OUTPUT
     if (fault1 == LOW) {
         Console.println("Motor1 Driver Fault");
     } else if (fault2 == LOW) {
@@ -167,6 +180,7 @@ void checkMotorDriverFault() {
     } else {
         Console.println("OK");
     }
+    #endif
 }
 
 void setPixelColor(rmt_item32_t* items, uint8_t red, uint8_t green, uint8_t blue) {
@@ -198,38 +212,60 @@ void initWS2812() {
     config.clk_div = 2;
     rmt_config(&config);
     rmt_driver_install(config.channel, 0, 0);
-    writePixelColor(200, 0, 0);
-}
-
-int normalizeJoystickInput(int axisValue) {
-    if (abs(axisValue) < DEAD_BAND) {
-        return 0;
-    }
-    return map(axisValue, -512, 512, -255, 255);
-}
-
-int calculatePWM(int axisX, int axisY) {
-    int pwmValue = axisY + axisX;
-    return constrain(pwmValue, -255, 255);
+    writePixelColor(120, 0, 0);
 }
 
 void controlMotor(Motor* motor, int pwmValue) {
+    // Ensure PWM value is within -1023 to +1023
+    pwmValue = constrain(pwmValue, -MAX_PWM_VALUE, MAX_PWM_VALUE);
+
     if (pwmValue >= 0) {
-        ledcWrite(motor->channel_forward, pwmValue);
-        ledcWrite(motor->channel_reverse, 0);
+        // Forward direction
+        ledcWrite(motor->channel_forward, pwmValue);        // Set forward speed
+        ledcWrite(motor->channel_reverse, 0);               // Reverse off
     } else {
-        ledcWrite(motor->channel_forward, 0);
-        ledcWrite(motor->channel_reverse, -pwmValue);
+        // Reverse direction
+        ledcWrite(motor->channel_forward, 0);               // Forward off
+        ledcWrite(motor->channel_reverse, -pwmValue);       // Set reverse speed
+    }
+    //Console.println(pwmValue);
+}
+
+// Neue Hilfsfunktion zur Skalierung der PWM mit Mindestwert
+int scaleMovementToPWM(float movement) {
+    if (movement > 0.0) {
+        return 110 + (int)(movement * (255 - 110));
+    } else if (movement < 0.0) {
+        return -110 - (int)(abs(movement) * (255 - 110));
+    } else {
+        return 0;
     }
 }
 
 void handleMotorControl(int axisX, int axisY, Motor* leftMotor, Motor* rightMotor) {
-    int normX = normalizeJoystickInput(axisX);
-    int normY = normalizeJoystickInput(axisY);
-    int leftPWM = calculatePWM(normX, normY);
-    int rightPWM = calculatePWM(normX, -normY);
+       // Totzone anwenden
+    int normX = (abs(axisX) < DEAD_BAND) ? 0 : axisX;
+    int normY = (abs(axisY) < DEAD_BAND) ? 0 : axisY;
+
+    // Berechnung der Bewegungsproportionen
+    float maxMovement = (float)(MAX_JOYSTICK_VALUE - DEAD_BAND);
+    float movementLeft = (float)(normY + normX) / maxMovement;
+    float movementRight = (float)(normY - normX) / maxMovement;
+
+    // PWM-Werte skalieren mit Mindestwert
+    int leftPWM = scaleMovementToPWM(movementLeft);
+    int rightPWM = scaleMovementToPWM(movementRight);
+
+    // PWM-Werte begrenzen
+    leftPWM = constrain(leftPWM, -MAX_PWM_VALUE, MAX_PWM_VALUE);
+    rightPWM = constrain(rightPWM, -MAX_PWM_VALUE, MAX_PWM_VALUE);
+    // Kontrolliere die Motoren
     controlMotor(leftMotor, leftPWM);
     controlMotor(rightMotor, rightPWM);
+    #ifdef DEBUG_OUTPUT
+    Console.println(rightPWM);
+    Console.println(leftPWM);
+    #endif
 }
 
 void processButtons(ControllerPtr ctl) {
@@ -293,6 +329,10 @@ void processButtons(ControllerPtr ctl) {
     if (miscState) {
         if (miscState & static_cast<unsigned long>(MiscButtons::HOME)) {
             Console.println("Home button pressed");
+            JoyLxNeutral = ctl->axisX();
+            JoyLyNeutral = ctl->axisY();
+            JoyRxNeutral = ctl->axisRX();
+            JoyRyNeutral = ctl->axisRY();
         }
         if (miscState & static_cast<unsigned long>(MiscButtons::MINUS)) {
             Console.println("Minus button pressed");
@@ -307,27 +347,69 @@ void processButtons(ControllerPtr ctl) {
 }
 
 void processGamepad(ControllerPtr ctl) {
-    if (JoyLx == -1) {
-        JoyLx = ctl->axisX();
+    #ifdef DEBUG_OUTPUT
+    // Ausgabe der Achsenwerte mit Offset und berechnetem Ausgabewert
+Console.println("----------------------");
+
+// Achse RX
+int realRX = ctl->axisRX();
+Console.print("Real Wert RX: ");
+Console.print(realRX);
+Console.print(" | Offset ist ");
+Console.println(JoyRxNeutral);
+Console.print("Ausgabewert RX: ");
+Console.println(realRX - JoyRxNeutral);
+
+// Achse RY
+int realRY = ctl->axisRY();
+Console.print("Real Wert RY: ");
+Console.print(realRY);
+Console.print(" | Offset ist ");
+Console.println(JoyRyNeutral);
+Console.print("Ausgabewert RY: ");
+Console.println(realRY - JoyRyNeutral);
+
+// Achse X
+int realX = ctl->axisX();
+Console.print("Real Wert X: ");
+Console.print(realX);
+Console.print(" | Offset ist ");
+Console.println(JoyLxNeutral);
+Console.print("Ausgabewert X: ");
+Console.println(realX - JoyLxNeutral);
+
+// Achse Y
+int realY = ctl->axisY();
+Console.print("Real Wert Y: ");
+Console.print(realY);
+Console.print(" | Offset ist ");
+Console.println(JoyLyNeutral);
+Console.print("Ausgabewert Y: ");
+Console.println(realY - JoyLyNeutral);
+
+Console.println("----------------------");
+#endif
+    if (JoyLxNeutral == -1) {
+        JoyLxNeutral = ctl->axisX();
     }
-    if (JoyLy == -1) {
-        JoyLy = ctl->axisY();
+    if (JoyLyNeutral == -1) {
+        JoyLyNeutral = ctl->axisY();
     }
-    if (JoyRx == -1) {
-        JoyRx = ctl->axisRX();
+    if (JoyRxNeutral == -1) {
+        JoyRxNeutral = ctl->axisRX();
     }
-    if (JoyRy == -1) {
-        JoyRy = ctl->axisRY();
+    if (JoyRyNeutral == -1) {
+        JoyRyNeutral = ctl->axisRY();
     }
     handleMotorControl(
-        ctl->axisRX() - JoyRx,
-        ctl->axisRY() - JoyRy,
+        ctl->axisRX() - JoyRxNeutral,
+        ctl->axisRY() - JoyRyNeutral,
         &motors[0],  // Left motor (Motor 1)
         &motors[1]   // Right motor (Motor 2)
     );
     handleMotorControl(
-        ctl->axisX() - JoyLx,
-        ctl->axisY() - JoyLy,
+        ctl->axisX() - JoyLxNeutral,
+        ctl->axisY() - JoyLyNeutral,
         &motors[2],  // Left motor (Motor 3)
         &motors[3]   // Right motor (Motor 4)
     );
@@ -391,7 +473,7 @@ void processControllers() {
 }
 
 void onConnectedController(ControllerPtr ctl) {
-    writePixelColor(0, 180, 0);
+    writePixelColor(0, 120, 0);
     bool foundEmptySlot = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == nullptr) {
@@ -447,5 +529,5 @@ void loop() {
     bool dataUpdated = BP32.update();
     if (dataUpdated)
         processControllers();
-    vTaskDelay(150);
+    vTaskDelay(10);
 }
