@@ -12,6 +12,11 @@
 #include "esp_adc_cal.h"
 #include "esp_log.h"
 #include "driver/ledc.h"
+#include <uni.h>
+
+// Definiere hier die MAC-Adressen der erlaubten Controller
+const char* allowedAddresses[] = {"98:B6:E9:01:6C:47", "98:B6:E9:01:66:C9"};
+const int numAllowed = sizeof(allowedAddresses) / sizeof(allowedAddresses[0]);
 
 #define DEBUG_OUTPUT 1
 
@@ -28,6 +33,10 @@
 #define T1H 34
 #define T1L 16
 #define BITS_PER_LED_CMD 24
+#define NUM_LEDS 20
+#define TOTAL_BITS (NUM_LEDS * BITS_PER_LED_CMD)
+
+static rmt_item32_t rmt_items[TOTAL_BITS];
 /*#define T0H 14
 #define T0L 52
 #define T1H 52
@@ -103,6 +112,8 @@ int JoyLxNeutral = -1;   // From your readings
 int JoyLyNeutral = -1;
 int JoyRxNeutral = -1;
 int JoyRyNeutral = -1;
+
+long timestampServo = 0;
 
 
 ControllerPtr myControllers[BP32_MAX_GAMEPADS];
@@ -183,36 +194,63 @@ void checkMotorDriverFault() {
     #endif
 }
 
-void setPixelColor(rmt_item32_t* items, uint8_t red, uint8_t green, uint8_t blue) {
-    uint32_t led_data = (green << 16) | (red << 8) | blue;
+// Function to set the color of a specific LED
+void setPixelColor(int led, uint8_t red, uint8_t green, uint8_t blue) {
+    if (led < 0 || led >= NUM_LEDS) {
+        printf("LED index out of range: %d\n", led);
+        return;
+    }
+
+    uint32_t led_data = (green << 16) | (red << 8) | blue; // GRB format
+    int base = led * BITS_PER_LED_CMD;
+
     for (int bit = 0; bit < BITS_PER_LED_CMD; bit++) {
         if (led_data & (1 << (23 - bit))) {
-            items[bit].duration0 = T1H;
-            items[bit].level0 = 1;
-            items[bit].duration1 = T1L;
-            items[bit].level1 = 0;
+            // Logical '1'
+            rmt_items[base + bit].duration0 = T1H;
+            rmt_items[base + bit].level0 = 1;
+            rmt_items[base + bit].duration1 = T1L;
+            rmt_items[base + bit].level1 = 0;
         } else {
-            items[bit].duration0 = T0H;
-            items[bit].level0 = 1;
-            items[bit].duration1 = T0L;
-            items[bit].level1 = 0;
+            // Logical '0'
+            rmt_items[base + bit].duration0 = T0H;
+            rmt_items[base + bit].level0 = 1;
+            rmt_items[base + bit].duration1 = T0L;
+            rmt_items[base + bit].level1 = 0;
         }
     }
 }
 
-void writePixelColor(uint8_t red, uint8_t green, uint8_t blue) {
-    rmt_item32_t items[BITS_PER_LED_CMD];
-    setPixelColor(items, red, green, blue);
-    rmt_write_items(RMT_TX_CHANNEL, items, BITS_PER_LED_CMD, true);
-    rmt_wait_tx_done(RMT_TX_CHANNEL, pdMS_TO_TICKS(100));
+// Function to update all LEDs with the current RMT buffer
+void showPixels() {
+    // Send RMT items
+    esp_err_t ret = rmt_write_items(RMT_TX_CHANNEL, rmt_items, TOTAL_BITS, true);
+    if (ret != ESP_OK) {
+        printf("RMT write failed: %d\n", ret);
+    }
+    
+    // Wait for transmission to complete
+    ret = rmt_wait_tx_done(RMT_TX_CHANNEL, pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) {
+        printf("RMT wait failed: %d\n", ret);
+    }
 }
 
+// Function to initialize the RMT peripheral for WS2812
 void initWS2812() {
+    // Configure RMT
     rmt_config_t config = RMT_DEFAULT_CONFIG_TX((gpio_num_t)LED_PIN, RMT_TX_CHANNEL);
-    config.clk_div = 2;
-    rmt_config(&config);
-    rmt_driver_install(config.channel, 0, 0);
-    writePixelColor(120, 0, 0);
+    config.clk_div = 2; // 40MHz clock (assuming APB clock is 80MHz)
+    config.mem_block_num = 1; // Allocate one memory block
+    config.tx_config.loop_en = false;
+    config.tx_config.carrier_en = false;
+    
+    // Initialize RMT
+    ESP_ERROR_CHECK(rmt_config(&config));
+    ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
+    
+    // Clear RMT buffer
+    memset(rmt_items, 0, sizeof(rmt_items));
 }
 
 void controlMotor(Motor* motor, int pwmValue) {
@@ -253,8 +291,8 @@ void handleMotorControl(int axisX, int axisY, Motor* leftMotor, Motor* rightMoto
     float movementRight = (float)(normY - normX) / maxMovement;
 
     // PWM-Werte skalieren mit Mindestwert
-    int leftPWM = scaleMovementToPWM(movementLeft);
-    int rightPWM = scaleMovementToPWM(movementRight);
+    int rightPWM = scaleMovementToPWM(movementLeft);
+    int leftPWM = scaleMovementToPWM(movementRight);
 
     // PWM-Werte begrenzen
     leftPWM = constrain(leftPWM, -MAX_PWM_VALUE, MAX_PWM_VALUE);
@@ -271,23 +309,47 @@ void handleMotorControl(int axisX, int axisY, Motor* leftMotor, Motor* rightMoto
 void processButtons(ControllerPtr ctl) {
     unsigned long buttonState = ctl->buttons();
     if (buttonState) {
-        if (buttonState & BUTTON_B) {
+        if (buttonState & BTN_B) {
             Console.println("Button B pressed");
+            for (int a = 1; a-19;a++) {
+                setPixelColor(a, 120, 120, 0);
+            }
+            showPixels();
         }
         if (buttonState & BTN_A) {
             Console.println("Button A pressed");
+            for (int a = 1; a-19;a++) {
+                setPixelColor(a, 0, 120, 0);
+            }
+            showPixels();
         }
         if (buttonState & BTN_Y) {
             Console.println("Button Y pressed");
+            for (int a = 1; a-19;a++) {
+                setPixelColor(a, 0, 120, 120);
+            }
+            showPixels();
         }
         if (buttonState & BTN_X) {
             Console.println("Button X pressed");
+            for (int a = 1; a-19;a++) {
+                setPixelColor(a, 0, 0, 120);
+            }
+            showPixels();
         }
         if (buttonState & BUTTON_L1) {
             Console.println("Button L1 pressed");
         }
         if (buttonState & BUTTON_R1) {
+            if (millis() - timestampServo < 1000) {
+                return;
+            }
+            timestampServo = millis();
             Console.println("Button R1 pressed");
+            setServoAngle(&servos[0], 150);
+            Console.println(servos[0].angle);
+            delay(100);
+            setServoAngle(&servos[0], 180);
         }
         if (buttonState & BUTTON_L2) {
             Console.println("Button L2 pressed");
@@ -473,7 +535,8 @@ void processControllers() {
 }
 
 void onConnectedController(ControllerPtr ctl) {
-    writePixelColor(0, 120, 0);
+    setPixelColor(0, 0, 120, 0);
+    showPixels();
     bool foundEmptySlot = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == nullptr) {
@@ -492,7 +555,12 @@ void onConnectedController(ControllerPtr ctl) {
 }
 
 void onDisconnectedController(ControllerPtr ctl) {
-    writePixelColor(200, 0, 0);
+    setPixelColor(0, 180, 0, 0);
+    showPixels();
+    controlMotor(&motors[0], 0);
+    controlMotor(&motors[1], 0);
+    controlMotor(&motors[2], 0);
+    controlMotor(&motors[3], 0);
     bool foundController = false;
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == ctl) {
@@ -520,7 +588,21 @@ void setup() {
     const uint8_t* addr = BP32.localBdAddress();
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
     BP32.setup(&onConnectedController, &onDisconnectedController);
-    BP32.forgetBluetoothKeys();
+    //BP32.forgetBluetoothKeys();
+    // 98:B6:E9:01:6C:47
+    // Whitlist
+    uni_bt_allowlist_init();
+
+    // Füge die erlaubten MAC-Adressen zur Allowlist hinzu
+    for (int i = 0; i < numAllowed; ++i) {
+        bd_addr_t addr;
+        sscanf_bd_addr(allowedAddresses[i], addr);
+        uni_bt_allowlist_add_addr(addr);
+    }
+
+    // Aktiviere die Whitelist-Überprüfung
+    uni_bt_allowlist_set_enabled(true);
+
     BP32.enableVirtualDevice(false);
     BP32.enableBLEService(false);
 }
